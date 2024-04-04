@@ -220,6 +220,7 @@ class SaverMixin():
             vertex_colors=v_rgb
         )
         mesh.export(self.get_save_path(filename))
+        return mesh
     
     def save_file(self, filename, src_path):
         shutil.copyfile(src_path, self.get_save_path(filename))

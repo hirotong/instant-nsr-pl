@@ -18,8 +18,9 @@ from systems.base import BaseSystem
 from systems.criterions import PSNR, binary_cross_entropy
 from utils.eval import MeshEvaluator
 
-@systems.register("neus-system")
-class NeuSSystem(BaseSystem):
+
+@systems.register("rot-neus-system")
+class RotNeuSSystem(BaseSystem):
     """
     Two ways to print to console:
     1. self.print: correctly handle progress bar
@@ -29,8 +30,7 @@ class NeuSSystem(BaseSystem):
     def prepare(self):
         self.criterions = {"psnr": PSNR()}
         self.train_num_samples = self.config.model.train_num_rays * (
-            self.config.model.num_samples_per_ray
-            + self.config.model.get("num_samples_per_ray_bg", 0)
+            self.config.model.num_samples_per_ray + self.config.model.get("num_samples_per_ray_bg", 0)
         )
         self.train_num_rays = self.config.model.train_num_rays
 
@@ -61,6 +61,7 @@ class NeuSSystem(BaseSystem):
                 )
         if stage in ["train"]:
             c2w = self.dataset.all_c2w[index]
+            cc2w = self.dataset.all_cc2w[index]
             x = torch.randint(
                 0,
                 self.dataset.w,
@@ -78,37 +79,30 @@ class NeuSSystem(BaseSystem):
             elif self.dataset.directions.ndim == 4:  # (N, H, W, 3)
                 directions = self.dataset.directions[index, y, x]
             rays_o, rays_d = get_rays(directions, c2w)
-            rgb = (
-                self.dataset.all_images[index, y, x]
-                .view(-1, self.dataset.all_images.shape[-1])
-                .to(self.rank)
-            )
+            crays_o, crays_d = get_rays(directions, cc2w)
+            rgb = self.dataset.all_images[index, y, x].view(-1, self.dataset.all_images.shape[-1]).to(self.rank)
             fg_mask = self.dataset.all_fg_masks[index, y, x].view(-1).to(self.rank)
         else:
             c2w = self.dataset.all_c2w[index][0]
+            cc2w = self.dataset.all_cc2w[index][0]
             if self.dataset.directions.ndim == 3:  # (H, W, 3)
                 directions = self.dataset.directions
             elif self.dataset.directions.ndim == 4:  # (N, H, W, 3)
                 directions = self.dataset.directions[index][0]
             rays_o, rays_d = get_rays(directions, c2w)
-            rgb = (
-                self.dataset.all_images[index]
-                .view(-1, self.dataset.all_images.shape[-1])
-                .to(self.rank)
-            )
+            crays_o, crays_d = get_rays(directions, cc2w)
+            rgb = self.dataset.all_images[index].view(-1, self.dataset.all_images.shape[-1]).to(self.rank)
             fg_mask = self.dataset.all_fg_masks[index].view(-1).to(self.rank)
 
         rays = torch.cat([rays_o, F.normalize(rays_d, p=2, dim=-1)], dim=-1)
+        crays = torch.cat([crays_o, F.normalize(crays_d, p=2, dim=-1)], dim=-1)
 
+        # TODO: Disable this part.
         if stage in ["train"]:
             if self.config.model.background_color == "white":
-                self.model.background_color = torch.ones(
-                    (3,), dtype=torch.float32, device=self.rank
-                )
+                self.model.background_color = torch.ones((3,), dtype=torch.float32, device=self.rank)
             elif self.config.model.background_color == "random":
-                self.model.background_color = torch.rand(
-                    (3,), dtype=torch.float32, device=self.rank
-                )
+                self.model.background_color = torch.rand((3,), dtype=torch.float32, device=self.rank)
             else:
                 raise NotImplementedError
         else:
@@ -117,13 +111,7 @@ class NeuSSystem(BaseSystem):
         if self.dataset.apply_mask:
             rgb = rgb * fg_mask[..., None] + self.model.background_color * (1 - fg_mask[..., None])
 
-        batch.update({"rays": rays, "rgb": rgb, "fg_mask": fg_mask})
-    
-    def on_before_optimizer_step(self, optimizer: Optimizer) -> None:
-        for name, param in self.model.named_parameters():
-            if param.grad is None:
-                print(name)
-
+        batch.update({"rays": torch.cat([rays, crays], dim=-1), "rgb": rgb, "fg_mask": fg_mask})
 
     def training_step(self, batch, batch_idx):
         out = self(batch)
@@ -132,10 +120,7 @@ class NeuSSystem(BaseSystem):
 
         # update train_num_rays
         if self.config.model.dynamic_ray_sampling:
-            train_num_rays = int(
-                self.train_num_rays
-                * (self.train_num_samples / out["num_samples_full"].sum().item())
-            )
+            train_num_rays = int(self.train_num_rays * (self.train_num_samples / out["num_samples_full"].sum().item()))
             self.train_num_rays = min(
                 int(self.train_num_rays * 0.9 + train_num_rays * 0.1),
                 self.config.model.max_train_num_rays,
@@ -155,26 +140,20 @@ class NeuSSystem(BaseSystem):
         self.log("train/loss_rgb", loss_rgb_l1)
         loss += loss_rgb_l1 * self.C(self.config.system.loss.lambda_rgb_l1)
 
-        loss_eikonal = (
-            (torch.linalg.norm(out["sdf_grad_samples"], ord=2, dim=-1) - 1.0) ** 2
-        ).mean()
+        loss_eikonal = ((torch.linalg.norm(out["sdf_grad_samples"], ord=2, dim=-1) - 1.0) ** 2).mean()
         self.log("train/loss_eikonal", loss_eikonal)
         loss += loss_eikonal * self.C(self.config.system.loss.lambda_eikonal)
 
         opacity = torch.clamp(out["opacity"].squeeze(-1), 1.0e-3, 1.0 - 1.0e-3)
         loss_mask = binary_cross_entropy(opacity, batch["fg_mask"].float())
         self.log("train/loss_mask", loss_mask)
-        loss += loss_mask * (
-            self.C(self.config.system.loss.lambda_mask) if self.dataset.has_mask else 0.0
-        )
+        loss += loss_mask * (self.C(self.config.system.loss.lambda_mask) if self.dataset.has_mask else 0.0)
 
         loss_opaque = binary_cross_entropy(opacity, opacity)
         self.log("train/loss_opaque", loss_opaque)
         loss += loss_opaque * self.C(self.config.system.loss.lambda_opaque)
 
-        loss_sparsity = torch.exp(
-            -self.config.system.loss.sparsity_scale * out["sdf_samples"].abs()
-        ).mean()
+        loss_sparsity = torch.exp(-self.config.system.loss.sparsity_scale * out["sdf_samples"].abs()).mean()
         self.log("train/loss_sparsity", loss_sparsity)
         loss += loss_sparsity * self.C(self.config.system.loss.lambda_sparsity)
 
@@ -189,16 +168,11 @@ class NeuSSystem(BaseSystem):
         # distortion loss proposed in MipNeRF360
         # an efficient implementation from https://github.com/sunset1995/torch_efficient_distloss
         if self.C(self.config.system.loss.lambda_distortion) > 0:
-            loss_distortion = flatten_eff_distloss(
-                out["weights"], out["points"], out["intervals"], out["ray_indices"]
-            )
+            loss_distortion = flatten_eff_distloss(out["weights"], out["points"], out["intervals"], out["ray_indices"])
             self.log("train/loss_distortion", loss_distortion)
             loss += loss_distortion * self.C(self.config.system.loss.lambda_distortion)
 
-        if (
-            self.config.model.learned_background
-            and self.C(self.config.system.loss.lambda_distortion_bg) > 0
-        ):
+        if self.config.model.learned_background and self.C(self.config.system.loss.lambda_distortion_bg) > 0:
             loss_distortion_bg = flatten_eff_distloss(
                 out["weights_bg"], out["points_bg"], out["intervals_bg"], out["ray_indices_bg"]
             )
@@ -220,6 +194,11 @@ class NeuSSystem(BaseSystem):
         self.log("train/num_rays", float(self.train_num_rays), prog_bar=True)
 
         return {"loss": loss}
+
+    def on_before_optimizer_step(self, optimizer: Optimizer) -> None:
+        for name, param in self.model.named_parameters():
+            if param.grad is None:
+                print(name)
 
     """
     # aggregate outputs from different devices (DP)
@@ -262,6 +241,11 @@ class NeuSSystem(BaseSystem):
                     "img": out["comp_rgb_full"].view(H, W, 3),
                     "kwargs": {"data_format": "HWC"},
                 },
+                {
+                    "type": "grayscale",
+                    "img": out["opacity"].view(H, W),
+                    "kwargs": {"data_range": (0, 1), "cmap": None},
+                },
             ]
             + (
                 [
@@ -274,6 +258,11 @@ class NeuSSystem(BaseSystem):
                         "type": "rgb",
                         "img": out["comp_rgb"].view(H, W, 3),
                         "kwargs": {"data_format": "HWC"},
+                    },
+                    {
+                        "type": "grayscale",
+                        "img": out["opacity_bg"].view(H, W),
+                        "kwargs": {"data_range": (0, 1), "cmap": None},
                     },
                 ]
                 if self.config.model.learned_background

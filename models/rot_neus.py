@@ -1,21 +1,24 @@
 import math
 
+from humanfriendly import time_units
 import nerfacc
+from sympy import tensordiagonal
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from nerfacc import (
-    OccGridEstimator,
-    accumulate_along_rays,
-    ray_aabb_intersect,
-    render_weight_from_alpha,
-    render_weight_from_density,
-)
 
 import models
 from models.base import BaseModel
-from models.utils import ContractionType, chunk_batch
+from models.utils import chunk_batch, ContractionType
 from systems.utils import update_module_step
+from nerfacc import (
+    OccGridEstimator,
+    PropNetEstimator,
+    render_weight_from_density,
+    render_weight_from_alpha,
+    accumulate_along_rays,
+    ray_aabb_intersect,
+)
 
 
 class VarianceNetwork(nn.Module):
@@ -47,12 +50,13 @@ class VarianceNetwork(nn.Module):
                 self.prev_inv_s = self.inv_s.item()
             else:
                 self.mod_val = min(
-                    (global_step / self.reach_max_steps) * (self.max_inv_s - self.prev_inv_s) + self.prev_inv_s,
+                    (global_step / self.reach_max_steps) * (self.max_inv_s - self.prev_inv_s)
+                    + self.prev_inv_s,
                     self.max_inv_s,
                 )
 
 
-@models.register("neus")
+@models.register("rot-neus")
 class NeuSModel(BaseModel):
     def setup(self):
         self.geometry = models.make(self.config.geometry.name, self.config.geometry)
@@ -63,9 +67,12 @@ class NeuSModel(BaseModel):
             self.geometry_bg = models.make(self.config.geometry_bg.name, self.config.geometry_bg)
             self.texture_bg = models.make(self.config.texture_bg.name, self.config.texture_bg)
             self.geometry_bg.contraction_type = ContractionType.UN_BOUNDED_SPHERE
-            self.near_plane_bg, self.far_plane_bg = 0.1, 1e3
-            self.cone_angle_bg = 10 ** (math.log10(self.far_plane_bg) / self.config.num_samples_per_ray_bg) - 1.0
-            self.render_step_size_bg = 0.01
+            self.near_plane_bg, self.far_plane_bg = 10, 1e3
+            self.cone_angle_bg = (
+                10 ** (math.log10(self.far_plane_bg) / self.config.num_samples_per_ray_bg) - 1.0
+            )
+            self.num_samples_per_ray_bg = self.config.num_samples_per_ray_bg
+            self.render_step_size_bg = 2 / self.num_samples_per_ray_bg
 
         self.variance = VarianceNetwork(self.config.variance)
         self.register_buffer(
@@ -88,10 +95,17 @@ class NeuSModel(BaseModel):
                 resolution=128,
             )
             if self.config.learned_background:
+                # TODO: fix this
                 self.occupancy_grid_bg = OccGridEstimator(
-                    roi_aabb=self.scene_aabb,
+                    roi_aabb=[
+                        -self.far_plane_bg,
+                        -self.far_plane_bg,
+                        -self.far_plane_bg,
+                        self.far_plane_bg,
+                        self.far_plane_bg,
+                        self.far_plane_bg,
+                    ],
                     resolution=256,
-                    # contraction_type=ContractionType.UN_BOUNDED_SPHERE,
                 )
         self.randomized = self.config.randomized
         self.background_color = None
@@ -106,7 +120,9 @@ class NeuSModel(BaseModel):
         update_module_step(self.variance, epoch, global_step)
 
         cos_anneal_end = self.config.get("cos_anneal_end", 0)
-        self.cos_anneal_ratio = 1.0 if cos_anneal_end == 0 else min(1.0, global_step / cos_anneal_end)
+        self.cos_anneal_ratio = (
+            1.0 if cos_anneal_end == 0 else min(1.0, global_step / cos_anneal_end)
+        )
 
         def occ_eval_fn(x):
             sdf = self.geometry(x, with_grad=False, with_feature=False)
@@ -152,7 +168,8 @@ class NeuSModel(BaseModel):
         # "cos_anneal_ratio" grows from 0 to 1 in the beginning training iterations. The anneal strategy below makes
         # the cos value "not dead" at the beginning training iterations, for better convergence.
         iter_cos = -(
-            F.relu(-true_cos * 0.5 + 0.5) * (1.0 - self.cos_anneal_ratio) + F.relu(-true_cos) * self.cos_anneal_ratio
+            F.relu(-true_cos * 0.5 + 0.5) * (1.0 - self.cos_anneal_ratio)
+            + F.relu(-true_cos) * self.cos_anneal_ratio
         )  # always non-positive
 
         # Estimate signed distances at section points
@@ -252,12 +269,24 @@ class NeuSModel(BaseModel):
 
     def forward_(self, rays):
         n_rays = rays.shape[0]
-        rays_o, rays_d = rays[:, 0:3], rays[:, 3:6]  # both (N_rays, 3)
+        fg_rays, bg_rays = rays.chunk(2, dim=-1)
+        fg_rays_o, fg_rays_d = fg_rays[:, 0:3], fg_rays[:, 3:6]
 
+        # def sigma_fn(t_starts, t_ends, ray_indices):
+        #     ray_indices = ray_indices.long()
+        #     t_origins = fg_rays_o[ray_indices]
+        #     t_dirs = fg_rays_d[ray_indices]
+        #     positions = t_origins + t_dirs * (t_starts + t_ends)[:, None] / 2.0
+        #     sdf, _, _ = self.geometry(positions)
+        #     alpha = self.get_alpha(sdf)
+        #     return alpha
+
+        # foreground
+        # t_min, t_max, hit = ray_aabb_intersect(fg_rays_o, fg_rays_d, self.scene_aabb[None])
         with torch.no_grad():
             ray_indices, t_starts, t_ends = self.occupancy_grid.sampling(
-                rays_o,
-                rays_d,
+                fg_rays_o,
+                fg_rays_d,
                 # sigma_fn=sigma_fn,
                 # t_min=t_min,
                 # t_max=t_max,
@@ -268,8 +297,8 @@ class NeuSModel(BaseModel):
             )
 
         ray_indices = ray_indices.long()
-        t_origins = rays_o[ray_indices]
-        t_dirs = rays_d[ray_indices]
+        t_origins = fg_rays_o[ray_indices]
+        t_dirs = fg_rays_d[ray_indices]
         midpoints = ((t_starts + t_ends) / 2.0)[..., None]
         positions = t_origins + t_dirs * midpoints
         dists = t_ends - t_starts
@@ -287,13 +316,20 @@ class NeuSModel(BaseModel):
         else:
             rgb = self.texture(feature, t_dirs, normal)
         # rgb = self.texture(feature, t_dirs, normal)
+        weights, _ = render_weight_from_alpha(alpha, ray_indices=ray_indices, n_rays=n_rays)
+        opacity = accumulate_along_rays(
+            weights, ray_indices=ray_indices, values=None, n_rays=n_rays
+        )
+        depth = accumulate_along_rays(
+            weights, ray_indices=ray_indices, values=midpoints, n_rays=n_rays
+        )
+        comp_rgb = accumulate_along_rays(
+            weights, ray_indices=ray_indices, values=rgb, n_rays=n_rays
+        )
 
-        weights, transmittance = render_weight_from_alpha(alpha, ray_indices=ray_indices, n_rays=n_rays)
-        opacity = accumulate_along_rays(weights, ray_indices=ray_indices, values=None, n_rays=n_rays)
-        depth = accumulate_along_rays(weights, ray_indices=ray_indices, values=midpoints, n_rays=n_rays)
-        comp_rgb = accumulate_along_rays(weights, ray_indices=ray_indices, values=rgb, n_rays=n_rays)
-
-        comp_normal = accumulate_along_rays(weights, ray_indices=ray_indices, values=normal, n_rays=n_rays)
+        comp_normal = accumulate_along_rays(
+            weights, ray_indices=ray_indices, values=normal, n_rays=n_rays
+        )
         comp_normal = F.normalize(comp_normal, p=2, dim=-1)
 
         out = {
@@ -320,7 +356,7 @@ class NeuSModel(BaseModel):
                 out.update({"sdf_laplace_samples": sdf_laplace})
 
         if self.config.learned_background:
-            out_bg = self.forward_bg_(rays)
+            out_bg = self.forward_bg_(bg_rays)
         else:
             out_bg = {
                 "comp_rgb": self.background_color[None, :].expand(*comp_rgb.shape),
@@ -374,6 +410,8 @@ class NeuSModel(BaseModel):
                 with_feature=True,
             )
             normal = F.normalize(sdf_grad, p=2, dim=-1)
-            rgb = self.texture(feature, -normal, normal)  # set the viewing directions to the normal to get "albedo"
+            rgb = self.texture(
+                feature, -normal, normal
+            )  # set the viewing directions to the normal to get "albedo"
             mesh["v_rgb"] = rgb.cpu()
         return mesh

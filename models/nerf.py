@@ -6,9 +6,9 @@ import torch.nn.functional as F
 
 import models
 from models.base import BaseModel
-from models.utils import chunk_batch
+from models.utils import chunk_batch, ContractionType
 from systems.utils import update_module_step
-from nerfacc import ContractionType, OccupancyGrid, ray_marching, render_weight_from_density, accumulate_along_rays
+from nerfacc import OccGridEstimator, render_weight_from_density, accumulate_along_rays
 
 
 @models.register('nerf')
@@ -34,10 +34,9 @@ class NeRFModel(BaseModel):
         self.geometry.contraction_type = self.contraction_type
 
         if self.config.grid_prune:
-            self.occupancy_grid = OccupancyGrid(
+            self.occupancy_grid = OccGridEstimator(
                 roi_aabb=self.scene_aabb,
                 resolution=self.occupancy_grid_res,
-                contraction_type=self.contraction_type
             )
         self.randomized = self.config.randomized
         self.background_color = None
@@ -80,7 +79,7 @@ class NeRFModel(BaseModel):
             return rgb, density[...,None]
 
         with torch.no_grad():
-            ray_indices, t_starts, t_ends = ray_marching(
+            ray_indices, t_starts, t_ends = self.occupancy_grid.sampling(
                 rays_o, rays_d,
                 scene_aabb=None if self.config.learned_background else self.scene_aabb,
                 grid=self.occupancy_grid if self.config.grid_prune else None,
