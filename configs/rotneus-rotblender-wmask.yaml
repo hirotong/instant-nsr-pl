@@ -1,4 +1,4 @@
-name: rot-neus-blender-${dataset.scene}
+name: rotneus-blender-${dataset.scene}
 tag: ""
 seed: 42
 

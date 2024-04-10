@@ -63,9 +63,12 @@ class NeuSModel(BaseModel):
             self.geometry_bg = models.make(self.config.geometry_bg.name, self.config.geometry_bg)
             self.texture_bg = models.make(self.config.texture_bg.name, self.config.texture_bg)
             self.geometry_bg.contraction_type = ContractionType.UN_BOUNDED_SPHERE
-            self.near_plane_bg, self.far_plane_bg = 0.1, 1e3
-            self.cone_angle_bg = 10 ** (math.log10(self.far_plane_bg) / self.config.num_samples_per_ray_bg) - 1.0
-            self.render_step_size_bg = 0.01
+            self.near_plane_bg, self.far_plane_bg = 10, 1e3
+            self.cone_angle_bg = (
+                10 ** (math.log10(self.far_plane_bg) / self.config.num_samples_per_ray_bg) - 1.0
+            )
+            self.num_samples_per_ray_bg = self.config.num_samples_per_ray_bg
+            self.render_step_size_bg = 2 / self.num_samples_per_ray_bg
 
         self.variance = VarianceNetwork(self.config.variance)
         self.register_buffer(
@@ -89,7 +92,14 @@ class NeuSModel(BaseModel):
             )
             if self.config.learned_background:
                 self.occupancy_grid_bg = OccGridEstimator(
-                    roi_aabb=self.scene_aabb,
+                    roi_aabb=[
+                        -self.far_plane_bg,
+                        -self.far_plane_bg,
+                        -self.far_plane_bg,
+                        self.far_plane_bg,
+                        self.far_plane_bg,
+                        self.far_plane_bg,
+                    ],
                     resolution=256,
                     # contraction_type=ContractionType.UN_BOUNDED_SPHERE,
                 )
@@ -106,7 +116,9 @@ class NeuSModel(BaseModel):
         update_module_step(self.variance, epoch, global_step)
 
         cos_anneal_end = self.config.get("cos_anneal_end", 0)
-        self.cos_anneal_ratio = 1.0 if cos_anneal_end == 0 else min(1.0, global_step / cos_anneal_end)
+        self.cos_anneal_ratio = (
+            1.0 if cos_anneal_end == 0 else min(1.0, global_step / cos_anneal_end)
+        )
 
         def occ_eval_fn(x):
             sdf = self.geometry(x, with_grad=False, with_feature=False)
@@ -152,7 +164,8 @@ class NeuSModel(BaseModel):
         # "cos_anneal_ratio" grows from 0 to 1 in the beginning training iterations. The anneal strategy below makes
         # the cos value "not dead" at the beginning training iterations, for better convergence.
         iter_cos = -(
-            F.relu(-true_cos * 0.5 + 0.5) * (1.0 - self.cos_anneal_ratio) + F.relu(-true_cos) * self.cos_anneal_ratio
+            F.relu(-true_cos * 0.5 + 0.5) * (1.0 - self.cos_anneal_ratio)
+            + F.relu(-true_cos) * self.cos_anneal_ratio
         )  # always non-positive
 
         # Estimate signed distances at section points
@@ -287,13 +300,20 @@ class NeuSModel(BaseModel):
         else:
             rgb = self.texture(feature, t_dirs, normal)
         # rgb = self.texture(feature, t_dirs, normal)
+        weights, _ = render_weight_from_alpha(alpha, ray_indices=ray_indices, n_rays=n_rays)
+        opacity = accumulate_along_rays(
+            weights, ray_indices=ray_indices, values=None, n_rays=n_rays
+        )
+        depth = accumulate_along_rays(
+            weights, ray_indices=ray_indices, values=midpoints, n_rays=n_rays
+        )
+        comp_rgb = accumulate_along_rays(
+            weights, ray_indices=ray_indices, values=rgb, n_rays=n_rays
+        )
 
-        weights, transmittance = render_weight_from_alpha(alpha, ray_indices=ray_indices, n_rays=n_rays)
-        opacity = accumulate_along_rays(weights, ray_indices=ray_indices, values=None, n_rays=n_rays)
-        depth = accumulate_along_rays(weights, ray_indices=ray_indices, values=midpoints, n_rays=n_rays)
-        comp_rgb = accumulate_along_rays(weights, ray_indices=ray_indices, values=rgb, n_rays=n_rays)
-
-        comp_normal = accumulate_along_rays(weights, ray_indices=ray_indices, values=normal, n_rays=n_rays)
+        comp_normal = accumulate_along_rays(
+            weights, ray_indices=ray_indices, values=normal, n_rays=n_rays
+        )
         comp_normal = F.normalize(comp_normal, p=2, dim=-1)
 
         out = {
@@ -374,6 +394,8 @@ class NeuSModel(BaseModel):
                 with_feature=True,
             )
             normal = F.normalize(sdf_grad, p=2, dim=-1)
-            rgb = self.texture(feature, -normal, normal)  # set the viewing directions to the normal to get "albedo"
+            rgb = self.texture(
+                feature, -normal, normal
+            )  # set the viewing directions to the normal to get "albedo"
             mesh["v_rgb"] = rgb.cpu()
         return mesh
