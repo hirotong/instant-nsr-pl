@@ -133,3 +133,16 @@ def cleanup():
     gc.collect()
     torch.cuda.empty_cache()
     tcnn.free_temporary_memory()
+
+
+def near_far_from_sphere(rays_o, rays_d, radius=1.0):
+    """
+    Get the near and far intersections for each ray on the sphere.
+    """
+    # ?
+    a = torch.sqrt(torch.sum(rays_d**2, dim=-1, keepdim=True))
+    b = 2.0 * torch.sum(rays_o * rays_d, dim=-1, keepdim=True)
+    mid = 0.5 * (-b) / a
+    near = mid - radius
+    far = mid + radius
+    return near, far

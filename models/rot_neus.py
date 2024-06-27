@@ -9,7 +9,7 @@ import torch.nn.functional as F
 
 import models
 from models.base import BaseModel
-from models.utils import chunk_batch, ContractionType
+from models.utils import chunk_batch, ContractionType, near_far_from_sphere
 from systems.utils import update_module_step
 from nerfacc import (
     OccGridEstimator,
@@ -57,7 +57,7 @@ class VarianceNetwork(nn.Module):
 
 
 @models.register("rot-neus")
-class NeuSModel(BaseModel):
+class RotNeuSModel(BaseModel):
     def setup(self):
         self.geometry = models.make(self.config.geometry.name, self.config.geometry)
         self.texture = models.make(self.config.texture.name, self.config.texture)
@@ -217,6 +217,8 @@ class NeuSModel(BaseModel):
         # ray_indices = torch.arange(n_rays, device=rays.device, dtype=torch.long).repeat_interleave(self.num_samples_per_ray_bg)
 
         t_min, t_max, hits = ray_aabb_intersect(rays_o, rays_d, self.scene_aabb[None])
+        t_near, t_far = near_far_from_sphere(rays_o, rays_d, self.config.radius)
+        
         # # if the ray intersects with the bounding box, start from the farther intersection point
         # # otherwise start from self.far_plane_bg
         # # note that in nerfacc t_max is set to 1e10 if there is no intersection
@@ -227,11 +229,11 @@ class NeuSModel(BaseModel):
                 rays_o,
                 rays_d,
                 sigma_fn=sigma_fn,
-                t_min=near_plane,
+                t_min=t_near,
                 far_plane=self.far_plane_bg,
                 alpha_thre=0.0,
                 stratified=self.randomized,
-                cone_angle=self.cone_angle_bg,
+                # cone_angle=self.cone_angle_bg,
             )
 
         midpoints = (t_starts + t_ends) / 2.0
