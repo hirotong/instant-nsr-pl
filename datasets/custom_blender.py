@@ -45,11 +45,19 @@ class RotBlenderDatasetBase:
         self.img_wh = (self.w, self.h)
 
         self.near, self.far = self.config.near_plane, self.config.far_plane
-
-        self.focal = 0.5 * w / math.tan(0.5 * meta["camera_angle_x"])  # scaled focal length
+        
+        if "camera_angle_x" in meta:
+            self.focal = 0.5 * w / math.tan(0.5 * meta["camera_angle_x"])  # scaled focal length
+            self.focal_x = self.focal_y = self.focal
+        else:
+            self.focal_x = meta["focal_x"]
+            self.focal_y = meta["focal_y"]
+            if "img_downscale" in self.config:
+                self.focal_x /= self.config.img_downscale
+                self.focal_y /= self.config.img_downscale
 
         # ray directions for all pixels, same for all images (same H, W, focal)
-        self.directions = get_ray_directions(self.w, self.h, self.focal, self.focal, self.w // 2, self.h // 2).to(
+        self.directions = get_ray_directions(self.w, self.h, self.focal_x, self.focal_y, self.w // 2, self.h // 2).to(
             self.rank
         )  # (h, w, 3)
 

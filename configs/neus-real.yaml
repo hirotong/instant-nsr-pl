@@ -1,28 +1,25 @@
-name: rotneus-blender-${dataset.scene}
+name: neus-blender-${dataset.scene}
 tag: ""
 seed: 42
 
 dataset:
-  name: rot-blender
+  name: blender
   scene: ???
   root_dir: ./load/nerf_synthetic/${dataset.scene}
   img_wh:
-    - 800
-    - 800
+    - 944
+    - 560
   # img_downscale: 1 # specify training image size by either img_wh or img_downscale
-  # camera_dist: 5.0
-  near_plane: 4.0
+  near_plane: 2.0
   far_plane: 6.0
   train_split: "train"
-  val_split: "val"
+  val_split: "test"
   test_split: "test"
-  apply_mask: true
 
 model:
-  name: rot-neus
-  radius: 1.0
+  name: neus
+  radius: 0.1
   num_samples_per_ray: 1024
-  num_samples_per_ray_bg: 1024
   train_num_rays: 256
   max_train_num_rays: 8192
   grid_prune: true
@@ -34,39 +31,6 @@ model:
   cos_anneal_end: 20000
   learned_background: false
   background_color: random
-  geometry_bg:
-    name: volume-density
-    radius: ${model.radius}
-    feature_dim: 8
-    density_activation: trunc_exp
-    density_bias: -1
-    isosurface: null
-    xyz_encoding_config:
-      otype: HashGrid
-      n_levels: 16
-      n_features_per_level: 2
-      log2_hashmap_size: 19
-      base_resolution: 32
-      per_level_scale: 1.3195079107728942
-    mlp_network_config:
-      otype: VanillaMLP
-      activation: ReLU
-      output_activation: none
-      n_neurons: 64
-      n_hidden_layers: 1
-  texture_bg:
-    name: volume-radiance
-    input_feature_dim: ${model.geometry_bg.feature_dim}
-    dir_encoding_config:
-      otype: SphericalHarmonics
-      degree: 4
-    mlp_network_config:
-      otype: VanillaMLP
-      activation: ReLU
-      output_activation: none
-      n_neurons: 64
-      n_hidden_layers: 2
-    color_activation: sigmoid
   variance:
     init_val: 0.3
     modulate: false
@@ -112,7 +76,7 @@ model:
     color_activation: sigmoid
 
 system:
-  name: rot-neus-system
+  name: neus-system
   loss:
     lambda_rgb_mse: 10.
     lambda_rgb_l1: 0.
@@ -122,7 +86,6 @@ system:
     lambda_sparsity: 0.0
     lambda_distortion: 0.
     lambda_opaque: 0.
-    lambda_distortion_bg: 0.
     sparsity_scale: 1.
   optimizer:
     name: AdamW
@@ -137,11 +100,6 @@ system:
         lr: 0.01
       variance:
         lr: 0.001
-      # remove this when learn_background = false
-      # geometry_bg:
-      #   lr: 0.01
-      # texture_bg:
-      #   lr: 0.01
   warmup_steps: 500
   scheduler:
     name: SequentialLR
@@ -165,10 +123,6 @@ checkpoint:
 export:
   chunk_size: 2097152
   export_vertex_color: True
-
-evaluation:
-  n_points: 100000
-  sample_ratio: 0.2
 
 trainer:
   max_steps: 20000
