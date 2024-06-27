@@ -22,7 +22,7 @@ model:
   name: rot-neus
   radius: 1.0
   num_samples_per_ray: 1024
-  num_samples_per_ray_bg: 1024
+  num_samples_per_ray_bg: 2048
   train_num_rays: 256
   max_train_num_rays: 8192
   grid_prune: true
