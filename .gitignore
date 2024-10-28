@@ -151,3 +151,6 @@ runs/
 load/
 extern/
 *.out
+
+slurmlogs/
+logs/

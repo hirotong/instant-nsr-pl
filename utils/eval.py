@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 # Author: hiro
 # Date: 2022-06-29 17:49:34
-# LastEditors: hiro
+# LastEditors: Please set LastEditors
 # Copyright (c) 2022 by hiro jinguang.tong@anu.edu.au, All Rights Reserved.
 
 import logging
 import numpy as np
 import trimesh
 
-from utils.libkdtree import KDTree
+# from utils.libkdtree import KDTree
+import sklearn.neighbors as skln
 from utils.libmesh import check_mesh_contains
 from utils.common import compute_iou
 
@@ -190,7 +191,7 @@ def distance_p2p(points_src, normals_src, points_tgt, normals_tgt):
         points_tgt (np.ndarray): target points
         normals_tgt (np.ndarray): target normals
     """
-    kdtree = KDTree(points_tgt)
+    kdtree = skln.KDTree(points_tgt)
     dist, idx = kdtree.query(points_src)
 
     if normals_src is not None and normals_tgt is not None:

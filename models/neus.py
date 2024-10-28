@@ -399,3 +399,4 @@ class NeuSModel(BaseModel):
             )  # set the viewing directions to the normal to get "albedo"
             mesh["v_rgb"] = rgb.cpu()
         return mesh
+

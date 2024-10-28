@@ -385,7 +385,7 @@ class RotNeuSSystem(BaseSystem):
         num_vertices = mesh_gt.vertices.shape[0]
         n_points = self.config.evaluation.n_points
         sample_ratio = self.config.evaluation.sample_ratio
-        n_points = max(n_points, int(num_vertices * sample_ratio))
+        # n_points = max(n_points, int(num_vertices * sample_ratio))
 
         pointcloud_gt, faces = mesh_gt.sample(n_points, return_index=True)
         pointcloud_gt = pointcloud_gt.astype(np.float32)

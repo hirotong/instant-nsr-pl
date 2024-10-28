@@ -1,4 +1,4 @@
-name: neus-blender-${dataset.scene}
+name: neus-blender-tat-${dataset.scene}
 tag: ""
 seed: 42
 

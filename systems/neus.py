@@ -1,4 +1,5 @@
 import os
+import open3d as o3d
 
 import numpy as np
 import pytorch_lightning as pl
@@ -15,8 +16,21 @@ import systems
 from models.ray_utils import get_rays
 from models.utils import cleanup
 from systems.base import BaseSystem
-from systems.criterions import PSNR, binary_cross_entropy
+from systems.criterions import PSNR, binary_cross_entropy, SSIM
 from utils.eval import MeshEvaluator
+from lpipsPyTorch import lpips as LPIPS
+
+
+def find_roi(mask):
+    mask = mask.squeeze()
+
+    indices = torch.nonzero(mask)
+
+    min_h, min_w = indices.min(dim=0).values.chunk(2)
+    max_h, max_w = indices.max(dim=0).values.chunk(2)
+
+    return min_h, min_w, max_h, max_w
+
 
 @systems.register("neus-system")
 class NeuSSystem(BaseSystem):
@@ -27,7 +41,7 @@ class NeuSSystem(BaseSystem):
     """
 
     def prepare(self):
-        self.criterions = {"psnr": PSNR()}
+        self.criterions = {"psnr": PSNR(), "ssim": SSIM(), "lpips": LPIPS}
         self.train_num_samples = self.config.model.train_num_rays * (
             self.config.model.num_samples_per_ray
             + self.config.model.get("num_samples_per_ray_bg", 0)
@@ -112,18 +126,21 @@ class NeuSSystem(BaseSystem):
             else:
                 raise NotImplementedError
         else:
-            self.model.background_color = torch.ones((3,), dtype=torch.float32, device=self.rank)
+            self.model.background_color = torch.ones(
+                (3,), dtype=torch.float32, device=self.rank
+            )
 
         if self.dataset.apply_mask:
-            rgb = rgb * fg_mask[..., None] + self.model.background_color * (1 - fg_mask[..., None])
+            rgb = rgb * fg_mask[..., None] + self.model.background_color * (
+                1 - fg_mask[..., None]
+            )
 
         batch.update({"rays": rays, "rgb": rgb, "fg_mask": fg_mask})
-    
+
     def on_before_optimizer_step(self, optimizer: Optimizer) -> None:
         for name, param in self.model.named_parameters():
             if param.grad is None:
                 print(name)
-
 
     def training_step(self, batch, batch_idx):
         out = self(batch)
@@ -134,7 +151,7 @@ class NeuSSystem(BaseSystem):
         if self.config.model.dynamic_ray_sampling:
             train_num_rays = int(
                 self.train_num_rays
-                * (self.train_num_samples / out["num_samples_full"].sum().item())
+                * (self.train_num_samples / (out["num_samples_full"].sum().item() + 1))
             )
             self.train_num_rays = min(
                 int(self.train_num_rays * 0.9 + train_num_rays * 0.1),
@@ -165,7 +182,9 @@ class NeuSSystem(BaseSystem):
         loss_mask = binary_cross_entropy(opacity, batch["fg_mask"].float())
         self.log("train/loss_mask", loss_mask)
         loss += loss_mask * (
-            self.C(self.config.system.loss.lambda_mask) if self.dataset.has_mask else 0.0
+            self.C(self.config.system.loss.lambda_mask)
+            if self.dataset.has_mask
+            else 0.0
         )
 
         loss_opaque = binary_cross_entropy(opacity, opacity)
@@ -200,10 +219,15 @@ class NeuSSystem(BaseSystem):
             and self.C(self.config.system.loss.lambda_distortion_bg) > 0
         ):
             loss_distortion_bg = flatten_eff_distloss(
-                out["weights_bg"], out["points_bg"], out["intervals_bg"], out["ray_indices_bg"]
+                out["weights_bg"],
+                out["points_bg"],
+                out["intervals_bg"],
+                out["ray_indices_bg"],
             )
             self.log("train/loss_distortion_bg", loss_distortion_bg)
-            loss += loss_distortion_bg * self.C(self.config.system.loss.lambda_distortion_bg)
+            loss += loss_distortion_bg * self.C(
+                self.config.system.loss.lambda_distortion_bg
+            )
 
         losses_model_reg = self.model.regularizations(out)
         for name, value in losses_model_reg.items():
@@ -247,8 +271,12 @@ class NeuSSystem(BaseSystem):
 
     def validation_step(self, batch, batch_idx):
         out = self(batch)
-        psnr = self.criterions["psnr"](out["comp_rgb_full"].to(batch["rgb"]), batch["rgb"])
         W, H = self.dataset.img_wh
+
+        psnr = self.criterions["psnr"](
+            out["comp_rgb_full"].to(batch["rgb"]), batch["rgb"]
+        )
+
         self.save_image_grid(
             f"it{self.global_step}-{batch['index'][0].item()}.png",
             [
@@ -289,7 +317,7 @@ class NeuSSystem(BaseSystem):
             ],
         )
         self.validation_step_outputs.append({"psnr": psnr, "index": batch["index"]})
-        return {"psnr": psnr, "index": batch["index"]}
+        return self.validation_step_outputs[-1]
 
     """
     # aggregate outputs from different devices when using DP
@@ -315,8 +343,40 @@ class NeuSSystem(BaseSystem):
 
     def test_step(self, batch, batch_idx):
         out = self(batch)
-        psnr = self.criterions["psnr"](out["comp_rgb_full"].to(batch["rgb"]), batch["rgb"])
+
         W, H = self.dataset.img_wh
+        fg_mask = batch["fg_mask"].view(H, W)
+        min_h, min_w, max_h, max_w = find_roi(fg_mask)
+
+        comp_rgb_full = out["comp_rgb_full"].view(H, W, 3)
+        comp_rgb_full = comp_rgb_full * fg_mask[..., None].to(comp_rgb_full) + (1 - fg_mask[..., None]).to(comp_rgb_full) * self.model.background_color.to(comp_rgb_full)
+
+        psnr = self.criterions["psnr"](
+            comp_rgb_full.view(1, H, W, 3)
+            .permute(0, 3, 1, 2)[:, :, min_h : max_h + 1, min_w : max_w + 1]
+            .to(batch["rgb"]),
+            batch["rgb"]
+            .view(1, H, W, 3)
+            .permute(0, 3, 1, 2)[:, :, min_h : max_h + 1, min_w : max_w + 1],
+        )
+        ssim = self.criterions["ssim"](
+            comp_rgb_full
+            .view(1, H, W, 3)
+            .permute(0, 3, 1, 2)[:, :, min_h : max_h + 1, min_w : max_w + 1]
+            .to(batch["rgb"]),
+            batch["rgb"]
+            .view(1, H, W, 3)
+            .permute(0, 3, 1, 2)[:, :, min_h : max_h + 1, min_w : max_w + 1],
+        )
+        lpips = self.criterions["lpips"](
+            comp_rgb_full
+            .view(1, H, W, 3)
+            .permute(0, 3, 1, 2)[:, :, min_h : max_h + 1, min_w : max_w + 1]
+            .to(batch["rgb"]),
+            batch["rgb"]
+            .view(1, H, W, 3)
+            .permute(0, 3, 1, 2)[:, :, min_h : max_h + 1, min_w : max_w + 1],
+        )
         self.save_image_grid(
             f"it{self.global_step}-test/{batch['index'][0].item()}.png",
             [
@@ -327,7 +387,7 @@ class NeuSSystem(BaseSystem):
                 },
                 {
                     "type": "rgb",
-                    "img": out["comp_rgb_full"].view(H, W, 3),
+                    "img": comp_rgb_full.view(H, W, 3),
                     "kwargs": {"data_format": "HWC"},
                 },
             ]
@@ -356,8 +416,10 @@ class NeuSSystem(BaseSystem):
                 },
             ],
         )
-        self.test_step_outputs.append({"psnr": psnr, "index": batch["index"]})
-        return {"psnr": psnr, "index": batch["index"]}
+        self.test_step_outputs.append(
+            {"psnr": psnr, "ssim": ssim, "lpips": lpips, "index": batch["index"]}
+        )
+        return self.test_step_outputs[-1]
 
     def on_test_epoch_end(self):
         """
@@ -370,13 +432,27 @@ class NeuSSystem(BaseSystem):
             for step_out in out:
                 # DP
                 if step_out["index"].ndim == 1:
-                    out_set[step_out["index"].item()] = {"psnr": step_out["psnr"]}
+                    out_set[step_out["index"].item()] = {
+                        "psnr": step_out["psnr"],
+                        "ssim": step_out["ssim"],
+                        "lpips": step_out["lpips"],
+                    }
                 # DDP
                 else:
                     for oi, index in enumerate(step_out["index"]):
-                        out_set[index[0].item()] = {"psnr": step_out["psnr"][oi]}
+                        out_set[index[0].item()] = {
+                            "psnr": step_out["psnr"][oi],
+                            "ssim": step_out["ssim"][oi],
+                            "lpips": step_out["lpips"][oi],
+                        }
             psnr = torch.mean(torch.stack([o["psnr"] for o in out_set.values()]))
-            self.log("test/psnr", psnr, prog_bar=True, rank_zero_only=True)
+            ssim = torch.mean(torch.stack([o["ssim"] for o in out_set.values()]))
+            lpips = torch.mean(torch.stack([o["lpips"] for o in out_set.values()]))
+            eval_img_dict = {
+                "PSNR": psnr.cpu().item(),
+                "SSIM": ssim.cpu().item(),
+                "LPIPS": lpips.cpu().item(),
+            }
 
             self.save_img_sequence(
                 f"it{self.global_step}-test",
@@ -386,34 +462,56 @@ class NeuSSystem(BaseSystem):
                 fps=3,
             )
 
-            mesh_pred = self.export()
-            self.evaluate_mesh(mesh_pred)
+            try:
+                mesh_pred = self.export()
+                eval_mesh_dict = self.evaluate_mesh(mesh_pred)
+            except:
+                eval_mesh_dict = {}
+            eval_df = pd.DataFrame(
+                {**eval_img_dict, **eval_mesh_dict}, index=[self.config.trial_name]
+            )
+            eval_df.to_csv(os.path.join(self.save_dir, "eval.csv"))
+
+            self.log_dict(
+                {**eval_img_dict, **eval_mesh_dict}, prog_bar=True, rank_zero_only=True
+            )
 
     def evaluate_mesh(self, mesh_pred):
-        mesh_gt_path = os.path.join(self.config.dataset.root_dir, "mesh_gt.obj")
-        mesh_gt = trimesh.load(mesh_gt_path, force="mesh", process=False)
-
-        num_vertices = mesh_gt.vertices.shape[0]
         n_points = self.config.evaluation.n_points
-        sample_ratio = self.config.evaluation.sample_ratio
-        n_points = max(n_points, int(num_vertices * sample_ratio))
+        pcd_gt_path = os.path.join(self.config.dataset.root_dir, "eval_points.ply")
+        if not os.path.exists(pcd_gt_path):
+            mesh_gt_path = os.path.join(self.config.dataset.root_dir, "eval_mesh.ply")
+            mesh_gt = o3d.io.read_triangle_mesh(mesh_gt_path)
+            pcd_gt = mesh_gt.sample_points_poisson_disk(n_points)
+            o3d.io.write_point_cloud(pcd_gt_path, pcd_gt)
+        else:
+            pcd_gt = o3d.io.read_point_cloud(pcd_gt_path)
 
-        pointcloud_gt, faces = mesh_gt.sample(n_points, return_index=True)
-        pointcloud_gt = pointcloud_gt.astype(np.float32)
-        normals_gt = mesh_gt.face_normals[faces]
-        
+        # num_vertices = mesh_gt.vertices.shape[0]
+        # sample_ratio = self.config.evaluation.sample_ratio
+        # n_points = max(n_points, int(num_vertices * sample_ratio))
+
+        # pointcloud_gt, faces = mesh_gt.sample(n_points, return_index=True)
+        # pointcloud_gt = pointcloud_gt.astype(np.float32)
+        # normals_gt = mesh_gt.face_normals[faces]
+        pointcloud_gt = np.asarray(pcd_gt.points)
+
         mesh_evaluator = MeshEvaluator(n_points=n_points)
-        eval_mesh_dict = mesh_evaluator.eval_mesh(mesh_pred, pointcloud_gt, normals_gt, None, None)
+        eval_mesh_dict = mesh_evaluator.eval_mesh(
+            mesh_pred, pointcloud_gt, None, None, None
+        )
 
-        out_file = os.path.join(self.save_dir, "eval.pkl")
-        out_file_csv = os.path.join(self.save_dir, "eval.csv")
+        # out_file = os.path.join(self.save_dir, "eval.pkl")
+        # out_file_csv = os.path.join(self.save_dir, "eval.csv")
 
         # Create pandas dataframe and save
-        eval_df = pd.DataFrame(eval_mesh_dict, index=[0])
-        eval_df.to_pickle(out_file)
-        eval_df.to_csv(out_file_csv)
-        
+        # eval_df = pd.DataFrame(eval_mesh_dict, index=[0])
+        # eval_df.to_pickle(out_file)
+        # eval_df.to_csv(out_file_csv)
+
         print(eval_mesh_dict)
+
+        return eval_mesh_dict
 
     def export(self):
         mesh = self.model.export(self.config.export)

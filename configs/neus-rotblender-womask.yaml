@@ -11,13 +11,12 @@ dataset:
     - 800
   # img_downscale: 1 # specify training image size by either img_wh or img_downscale
   # camera_dist: 5.0
-  near_plane: 4.0
-  far_plane: 6.0
+  near_plane: 3.0
+  far_plane: 5.0
   train_split: "train"
   val_split: "val"
   test_split: "test"
-  apply_mask: true
-  mask_level: 0   # ✅
+  apply_mask: False
 
 model:
   name: neus
@@ -33,7 +32,7 @@ model:
   randomized: true
   ray_chunk: 4096
   cos_anneal_end: 20000
-  learned_background: false
+  learned_background: true
   background_color: random
   geometry_bg:
     name: volume-density
@@ -115,10 +114,10 @@ model:
 system:
   name: neus-system
   loss:
-    lambda_rgb_mse: 10.
+    lambda_rgb_mse: 1.
     lambda_rgb_l1: 0.
-    lambda_mask: 0.1
-    lambda_eikonal: 0.1
+    lambda_mask: 0.
+    lambda_eikonal: 0.
     lambda_curvature: 0.
     lambda_sparsity: 0.0
     lambda_distortion: 0.
@@ -138,11 +137,10 @@ system:
         lr: 0.01
       variance:
         lr: 0.001
-      # remove this when learn_background = false
-      # geometry_bg:
-      #   lr: 0.01
-      # texture_bg:
-      #   lr: 0.01
+      geometry_bg:
+        lr: 0.01
+      texture_bg:
+        lr: 0.01
   warmup_steps: 500
   scheduler:
     name: SequentialLR
@@ -170,7 +168,7 @@ export:
 evaluation:
   n_points: 100000
   sample_ratio: 0.2
-
+  
 trainer:
   max_steps: 20000
   log_every_n_steps: 100
