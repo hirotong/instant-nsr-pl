@@ -13,4 +13,4 @@ def make(name, config):
     return dataset
 
 
-from . import blender, colmap, dtu, custom_blender
+from . import blender, colmap, dtu, custom_blender, nerosync
